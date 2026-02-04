@@ -4,7 +4,8 @@ use {
     redis::{self, Commands, Connection},
     serde::Deserialize,
     std::{
-        time::SystemTime,
+        thread,
+        time::{Duration, SystemTime},
     },
 };
 
@@ -18,6 +19,7 @@ pub struct WatcherConf {
 /// A watcher watches the events incoming in one specific queue
 /// and applies rules to generate tasks
 pub struct Watcher {
+    client: redis::Client,
     con: Connection,
     listener_channel: String,
     input_queue: String,
@@ -44,6 +46,7 @@ impl Watcher {
         let con = client.get_connection()?;
         debug!("got redis connection");
         Ok(Self {
+            client,
             con,
             listener_channel,
             input_queue,
@@ -61,7 +64,7 @@ impl Watcher {
     ///
     /// This is done on start to reschedule the tasks that
     /// weren't completely handled.
-    fn empty_taken_queue(&mut self) {
+    fn empty_taken_queue(&mut self) -> () {
         debug!("watcher cleans its taken queue");
         let mut n = 0;
         while let Ok(taken) = self.con.rpoplpush::<_, String>(&self.taken_queue, &self.input_queue) {
@@ -119,27 +122,72 @@ impl Watcher {
             if let Some(task_set) = r.set.as_ref() {
                 // we push first to the task set, to avoid a race condition:
                 // a worker not finding the task in the set
-                self.con.zadd(task_set, &r.task, now)?;
+                self.con.zadd::<_, _, _, ()>(task_set, &r.task, now)?;
                 debug!(
                     "      {:?} pushed to task_set {:?} @ {}",
                     &r.task, task_set, now
                 );
             }
-            self.con.lpush(&r.queue, &r.task)?;
-            self.con.publish(
+            self.con.lpush::<_, _, ()>(&r.queue, &r.task)?;
+            self.con.publish::<_, _, ()>(
                 &self.listener_channel,
                 format!("{} TRIGGER {} -> {}", &self.taken_queue, &event, &r.task),
             )?;
         }
 
         // the event can now be removed from the taken queue
-        self.con.lrem(&self.taken_queue, 1, &event)?;
-        self.con.publish(
+        self.con.lrem::<_, _, ()>(&self.taken_queue, 1, &event)?;
+        self.con.publish::<_, _, ()>(
             &self.listener_channel,
             format!("{} DONE {}", &self.taken_queue, &event),
         )?;
         debug!(" done with task {:?}", &event);
         Ok(())
+    }
+
+    /// Reconnect to Redis when connection is lost
+    fn reconnect(&mut self) -> Result<(), RescError> {
+        warn!("Attempting to reconnect to Redis...");
+        let mut retry_delay = Duration::from_secs(1);
+        let max_delay = Duration::from_secs(30);
+        
+        loop {
+            match self.client.get_connection() {
+                Ok(con) => {
+                    self.con = con;
+                    info!("Successfully reconnected to Redis");
+                    return Ok(());
+                }
+                Err(e) => {
+                    error!("Failed to reconnect to Redis: {}. Retrying in {:?}...", e, retry_delay);
+                    thread::sleep(retry_delay);
+                    retry_delay = (retry_delay * 2).min(max_delay);
+                }
+            }
+        }
+    }
+
+    /// Check if the error is a connection error that requires reconnection
+    fn is_connection_error(e: &redis::RedisError) -> bool {
+        match e.kind() {
+            redis::ErrorKind::IoError => true,
+            redis::ErrorKind::ResponseError => {
+                // Check if it's a broken pipe or connection error
+                let msg = format!("{}", e);
+                msg.contains("Broken pipe") || 
+                msg.contains("Connection reset") ||
+                msg.contains("Connection refused") ||
+                msg.contains("not connected")
+            }
+            _ => {
+                // Also check the error message for connection-related errors
+                let msg = format!("{}", e);
+                msg.contains("Broken pipe") || 
+                msg.contains("Connection reset") ||
+                msg.contains("Connection refused") ||
+                msg.contains("not connected")
+            }
+        }
     }
 
     /// continuously watch the input queue an apply rules on the events
@@ -152,7 +200,17 @@ impl Watcher {
                     self.handle_input_event(event)?
                 }
                 Err(e) => {
-                    error!("BRPOPLPUSH on {:?} failed : {}", &self.input_queue, e);
+                    if Self::is_connection_error(&e) {
+                        error!("BRPOPLPUSH on {:?} failed with connection error: {}", &self.input_queue, e);
+                        self.reconnect()?;
+                        // After reconnecting, we should empty the taken queue again
+                        // to reschedule any tasks that might have been in progress
+                        self.empty_taken_queue();
+                    } else {
+                        error!("BRPOPLPUSH on {:?} failed : {}", &self.input_queue, e);
+                        // For non-connection errors, add a small delay to avoid tight error loops
+                        thread::sleep(Duration::from_millis(100));
+                    }
                 }
             }
         }
